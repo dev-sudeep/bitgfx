@@ -51,9 +51,54 @@ void bg_get_mouse_pos(int *x, int *y);
 int  bg_is_mouse_down(int button); /* 0=left, 1=right, 2=middle */
 int  bg_is_key_down(int keycode);
 
+/* Special key codes returned by bg_next_key() */
+#define BG_KEY_NONE       0
+#define BG_KEY_BACKSPACE  8
+#define BG_KEY_TAB        9
+#define BG_KEY_ENTER      13
+#define BG_KEY_ESCAPE     27
+#define BG_KEY_LEFT       0x10001u
+#define BG_KEY_RIGHT      0x10002u
+#define BG_KEY_UP         0x10003u
+#define BG_KEY_DOWN       0x10004u
+#define BG_KEY_DELETE     0x10005u
+#define BG_KEY_HOME       0x10006u
+#define BG_KEY_END        0x10007u
+
+/*
+ * Dequeue one key event from the internal ring buffer.
+ * Returns BG_KEY_NONE (0) when the queue is empty.
+ * Printable ASCII characters are returned as their char value (32-126).
+ * Special keys are returned as one of the BG_KEY_* constants above.
+ */
+uint32_t bg_next_key(void);
+
 /* -- UI -- */
 /* Returns 1 if button is currently being clicked */
 int bg_draw_button(int x, int y, int w, int h, const char *label);
+
+/*
+ * Text input box  --  immediate-mode, caller owns the BgTextbox struct.
+ *
+ * Usage:
+ *   static BgTextbox tb;          // zero-initialise once
+ *   bg_draw_textbox(10, 10, 200, 24, &tb);
+ *   // tb.buf holds the current text, tb.len is its length.
+ *
+ * The box gains focus when clicked and loses it when Escape is pressed or
+ * the user clicks elsewhere.  Backspace deletes the last character.
+ * Returns 1 on the frame that Enter is pressed while the box is focused.
+ */
+#define BG_TEXTBOX_MAX 255
+
+typedef struct {
+    char     buf[BG_TEXTBOX_MAX + 1]; /* null-terminated text            */
+    int      len;                      /* current character count         */
+    int      focused;                  /* 1 = this box has keyboard focus */
+    uint32_t cursor_timer;             /* frame counter for cursor blink  */
+} BgTextbox;
+
+int bg_draw_textbox(int x, int y, int w, int h, BgTextbox *tb);
 
 /* =========================================================================
  * 8x8 BITMAP FONT  (visible in header so client can reference glyph data)
@@ -174,6 +219,21 @@ static int bg__should_close  = 0;
 static int bg__mouse_x       = 0;
 static int bg__mouse_y       = 0;
 static int bg__mouse_buttons = 0;   /* bit 0=left, 1=right, 2=middle */
+static int bg__mouse_click    = 0;   /* 1 on the frame LMB transitions low->high */
+
+/* Key event ring buffer (platform-independent) */
+#define BG__KEY_QUEUE_SIZE 64
+static uint32_t bg__key_queue[BG__KEY_QUEUE_SIZE];
+static int      bg__key_head = 0; /* read  index */
+static int      bg__key_tail = 0; /* write index */
+
+static inline void bg__key_push(uint32_t k) {
+    int next = (bg__key_tail + 1) % BG__KEY_QUEUE_SIZE;
+    if (next != bg__key_head) {
+        bg__key_queue[bg__key_tail] = k;
+        bg__key_tail = next;
+    }
+}
 
 /* -------------------------------------------------------------------------
  * Internal helpers (shared)
@@ -250,6 +310,7 @@ int bg_init(int width, int height, const char *title) {
 }
 
 void bg_poll_events(void) {
+    bg__mouse_click = 0; /* cleared at the start of every poll */
     XEvent ev;
     while (XPending(bg__dpy)) {
         XNextEvent(bg__dpy, &ev);
@@ -263,9 +324,9 @@ void bg_poll_events(void) {
                 bg__mouse_y = ev.xmotion.y;
                 break;
             case ButtonPress:
-                if (ev.xbutton.button == Button1) bg__mouse_buttons |=  (1 << 0);
-                if (ev.xbutton.button == Button3) bg__mouse_buttons |=  (1 << 1);
-                if (ev.xbutton.button == Button2) bg__mouse_buttons |=  (1 << 2);
+                if (ev.xbutton.button == Button1) { bg__mouse_buttons |= (1<<0); bg__mouse_click = 1; }
+                if (ev.xbutton.button == Button3)   bg__mouse_buttons |= (1<<1);
+                if (ev.xbutton.button == Button2)   bg__mouse_buttons |= (1<<2);
                 break;
             case ButtonRelease:
                 if (ev.xbutton.button == Button1) bg__mouse_buttons &= ~(1 << 0);
@@ -275,6 +336,33 @@ void bg_poll_events(void) {
             case DestroyNotify:
                 bg__should_close = 1;
                 break;
+            case KeyPress: {
+                char    buf[8] = {0};
+                KeySym  sym    = 0;
+                int     n      = XLookupString(&ev.xkey, buf, sizeof(buf)-1, &sym, NULL);
+                uint32_t k     = BG_KEY_NONE;
+                /* Map special keys first */
+                switch (sym) {
+                    case XK_BackSpace: k = BG_KEY_BACKSPACE; break;
+                    case XK_Tab:       k = BG_KEY_TAB;       break;
+                    case XK_Return:
+                    case XK_KP_Enter:  k = BG_KEY_ENTER;     break;
+                    case XK_Escape:    k = BG_KEY_ESCAPE;     break;
+                    case XK_Left:      k = BG_KEY_LEFT;       break;
+                    case XK_Right:     k = BG_KEY_RIGHT;      break;
+                    case XK_Up:        k = BG_KEY_UP;         break;
+                    case XK_Down:      k = BG_KEY_DOWN;       break;
+                    case XK_Delete:    k = BG_KEY_DELETE;     break;
+                    case XK_Home:      k = BG_KEY_HOME;       break;
+                    case XK_End:       k = BG_KEY_END;        break;
+                    default:
+                        if (n > 0 && (unsigned char)buf[0] >= 32 && (unsigned char)buf[0] <= 126)
+                            k = (uint32_t)(unsigned char)buf[0];
+                        break;
+                }
+                if (k != BG_KEY_NONE) bg__key_push(k);
+                break;
+            }
             default: break;
         }
     }
@@ -441,6 +529,7 @@ int bg_init(int width, int height, const char *title) {
 }
 
 void bg_poll_events(void) {
+    bg__mouse_click = 0; /* cleared at the start of every poll */
     /* Drain & renew autorelease pool */
     BG_MSG(void, bg__pool, "drain");
     bg__pool = BG_MSG(id, BG_MSG(id, objc_getClass("NSAutoreleasePool"), "alloc"), "init");
@@ -459,7 +548,8 @@ void bg_poll_events(void) {
 
         switch (type) {
             case  1: /* NSEventTypeLeftMouseDown  */
-                bg__mouse_buttons |=  (1 << 0);
+                bg__mouse_buttons |= (1 << 0);
+                bg__mouse_click = 1;
                 bg__update_mouse_from_event(event);
                 break;
             case  2: /* NSEventTypeLeftMouseUp    */
@@ -480,12 +570,43 @@ void bg_poll_events(void) {
                 bg__update_mouse_from_event(event);
                 break;
             case 12: { /* NSEventTypeKeyDown */
-                /* Check for window close shortcut Cmd+W */
                 NSUInteger mods = BG_MSG(NSUInteger, event, "modifierFlags");
-                if (mods & (1 << 20)) { /* NSEventModifierFlagCommand */
-                    id chars = BG_MSG(id, event, "charactersIgnoringModifiers");
-                    const char *cs = BG_MSG(const char*, chars, "UTF8String");
-                    if (cs && cs[0] == 'w') bg__should_close = 1;
+                /* Cmd+W closes window */
+                if (mods & (1u << 20)) {
+                    id ci = BG_MSG(id, event, "charactersIgnoringModifiers");
+                    const char *cw = BG_MSG(const char*, ci, "UTF8String");
+                    if (cw && cw[0] == 'w') { bg__should_close = 1; break; }
+                }
+                /* Skip Command/Control key combos (except Backspace/Delete) */
+                if (!(mods & ((1u<<20)|(1u<<18)))) { /* not Cmd, not Ctrl */
+                    /* keyCode: 51=Backspace, 36=Return, 76=KPEnter,
+                                 53=Escape, 48=Tab, 123=Left, 124=Right,
+                                 126=Up, 125=Down, 117=Delete,
+                                 115=Home, 119=End                       */
+                    NSUInteger kc = BG_MSG(NSUInteger, event, "keyCode");
+                    uint32_t k = BG_KEY_NONE;
+                    switch (kc) {
+                        case  51: k = BG_KEY_BACKSPACE; break;
+                        case  36:
+                        case  76: k = BG_KEY_ENTER;     break;
+                        case  53: k = BG_KEY_ESCAPE;    break;
+                        case  48: k = BG_KEY_TAB;       break;
+                        case 123: k = BG_KEY_LEFT;      break;
+                        case 124: k = BG_KEY_RIGHT;     break;
+                        case 126: k = BG_KEY_UP;        break;
+                        case 125: k = BG_KEY_DOWN;      break;
+                        case 117: k = BG_KEY_DELETE;    break;
+                        case 115: k = BG_KEY_HOME;      break;
+                        case 119: k = BG_KEY_END;       break;
+                        default: {
+                            id ch = BG_MSG(id, event, "characters");
+                            const char *cs = BG_MSG(const char*, ch, "UTF8String");
+                            if (cs && (unsigned char)cs[0] >= 32 && (unsigned char)cs[0] <= 126)
+                                k = (uint32_t)(unsigned char)cs[0];
+                            break;
+                        }
+                    }
+                    if (k != BG_KEY_NONE) bg__key_push(k);
                 }
                 break;
             }
@@ -535,6 +656,105 @@ void bg_get_mouse_pos(int *x, int *y) {
 
 int bg_is_mouse_down(int button) {
     return (bg__mouse_buttons >> button) & 1;
+}
+
+/* ---- bg_next_key ---- */
+uint32_t bg_next_key(void) {
+    if (bg__key_head == bg__key_tail) return BG_KEY_NONE;
+    uint32_t k = bg__key_queue[bg__key_head];
+    bg__key_head = (bg__key_head + 1) % BG__KEY_QUEUE_SIZE;
+    return k;
+}
+
+/* ---- bg_draw_textbox ---- */
+int bg_draw_textbox(int x, int y, int w, int h, BgTextbox *tb) {
+    int entered = 0;
+
+    /* --- Focus: click inside gains focus, click outside loses it --- */
+    int mx, my;
+    bg_get_mouse_pos(&mx, &my);
+    int inside = (mx >= x && mx < x + w && my >= y && my < y + h);
+
+    /* Detect left mouse press this frame via a one-shot edge (compare
+       previous frame state is not tracked, so we just test the instant
+       the button is held and the cursor is inside -- good enough for
+       immediate mode at typical frame rates).                          */
+    int clicked = bg__mouse_click;
+
+    if (clicked) {
+        tb->focused = inside ? 1 : 0;
+    }
+
+    /* --- Process key events when focused --- */
+    if (tb->focused) {
+        uint32_t k;
+        while ((k = bg_next_key()) != BG_KEY_NONE) {
+            if (k == BG_KEY_ESCAPE) {
+                tb->focused = 0;
+            } else if (k == BG_KEY_ENTER) {
+                entered = 1;
+                /* keep focus so caller can decide */
+            } else if (k == BG_KEY_BACKSPACE) {
+                if (tb->len > 0) {
+                    tb->len--;
+                    tb->buf[tb->len] = '\0';
+                }
+            } else if (k >= 32 && k <= 126) {
+                if (tb->len < BG_TEXTBOX_MAX) {
+                    tb->buf[tb->len++] = (char)k;
+                    tb->buf[tb->len]   = '\0';
+                }
+            }
+        }
+        tb->cursor_timer++;
+    } else {
+        tb->cursor_timer = 0;
+    }
+
+    /* --- Draw box background --- */
+    uint8_t bg_r, bg_g, bg_b;
+    if (tb->focused) {
+        bg_r = 18; bg_g = 18; bg_b = 30;
+    } else {
+        bg_r = 28; bg_g = 28; bg_b = 38;
+    }
+    bg_fill_rect(x, y, w, h, bg_r, bg_g, bg_b);
+
+    /* --- Border (brighter when focused) --- */
+    uint8_t bdr_r, bdr_g, bdr_b;
+    if (tb->focused) {
+        bdr_r = 100; bdr_g = 140; bdr_b = 255;
+    } else {
+        bdr_r = 80;  bdr_g =  80; bdr_b = 110;
+    }
+    bg_draw_rect(x, y, w, h, bdr_r, bdr_g, bdr_b);
+
+    /* --- Text content (clipped to box with 4px inner padding) --- */
+    int pad   = 4;
+    int max_chars = (w - pad * 2 - 10 /* cursor width */) / 9;
+    if (max_chars < 1) max_chars = 1;
+
+    /* Show a suffix of the buffer so the newest characters are visible */
+    const char *display = tb->buf;
+    int dlen = tb->len;
+    if (dlen > max_chars) {
+        display = tb->buf + (dlen - max_chars);
+        dlen    = max_chars;
+    }
+
+    int ty = y + (h - 8) / 2;
+    bg_draw_text(x + pad, ty, display, 220, 220, 240);
+
+    /* --- Blinking cursor (30-frame period) --- */
+    if (tb->focused && (tb->cursor_timer % 30) < 15) {
+        int cx = x + pad + dlen * 9;
+        /* Make sure cursor stays inside box */
+        if (cx < x + w - pad - 2) {
+            bg_draw_line(cx, ty, cx, ty + 7, 180, 200, 255);
+        }
+    }
+
+    return entered;
 }
 
 /* ---- bg_clear ---- */
@@ -599,7 +819,7 @@ void bg_draw_text(int x, int y, const char *text, uint8_t r, uint8_t g, uint8_t 
         const uint8_t *glyph = bg_font8x8[c - 32];
         for (int row = 0; row < 8; row++) {
             for (int col = 0; col < 8; col++) {
-                if (glyph[row] & (0x80 >> col))
+                if (glyph[row] & (1 << col))
                     bg__put_pixel_raw(cx + col, y + row, r, g, b);
             }
         }
