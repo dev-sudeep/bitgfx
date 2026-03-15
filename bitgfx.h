@@ -422,7 +422,6 @@ static id bg__app       = nil;
 static id bg__window    = nil;
 static id bg__view      = nil;
 static id bg__pool      = nil;
-static CGContextRef bg__cg_ctx = NULL;
 static CGColorSpaceRef bg__colorspace = NULL;
 
 /* ---- Custom NSView subclass for drawing ---- */
@@ -430,8 +429,9 @@ static Class bg__ViewClass = NULL;
 
 static void bg__view_drawRect(id self, SEL _cmd, CGRect rect) {
     (void)_cmd; (void)rect;
-    CGContextRef ctx = BG_MSG(CGContextRef, BG_MSG(id, objc_getClass("NSGraphicsContext"),
-                               "currentContext"), "CGContext");
+    id bg__gc = BG_MSG(id, objc_getClass("NSGraphicsContext"), "currentContext");
+    if (!bg__gc) return;
+    CGContextRef ctx = BG_MSG(CGContextRef, bg__gc, "CGContext");
     if (!ctx) return;
 
     CGDataProviderRef provider = CGDataProviderCreateWithData(
@@ -449,8 +449,14 @@ static void bg__view_drawRect(id self, SEL _cmd, CGRect rect) {
     CGDataProviderRelease(provider);
     if (!img) return;
 
-    CGRect bounds = CGRectMake(0, 0, bg__width, bg__height);
+    /* CoreGraphics origin is bottom-left; flip vertically so the buffer
+       (which is top-left origin) renders the right way up.              */
+    CGContextSaveGState(ctx);
+    CGContextTranslateCTM(ctx, 0, (CGFloat)bg__height);
+    CGContextScaleCTM(ctx, 1.0, -1.0);
+    CGRect bounds = CGRectMake(0, 0, (CGFloat)bg__width, (CGFloat)bg__height);
     CGContextDrawImage(ctx, bounds, img);
+    CGContextRestoreGState(ctx);
     CGImageRelease(img);
 }
 
@@ -515,10 +521,11 @@ int bg_init(int width, int height, const char *title) {
                          "stringWithUTF8String:", title);
     BG_MSG(void, bg__window, "setTitle:", nsTitle);
 
-    /* Create view */
+    /* Create view — frame is in superview coords, so origin must be (0,0) */
+    CGRect content_rect = CGRectMake(0, 0, (CGFloat)width, (CGFloat)height);
     id view = BG_MSG(id, (id)bg__ViewClass, "alloc");
     view = ((id(*)(id,SEL,CGRect))objc_msgSend)(
-               view, sel_getUid("initWithFrame:"), frame);
+               view, sel_getUid("initWithFrame:"), content_rect);
     bg__view = view;
 
     BG_MSG(void, bg__window, "setContentView:", bg__view);
@@ -540,7 +547,7 @@ void bg_poll_events(void) {
                        sel_getUid("nextEventMatchingMask:untilDate:inMode:dequeue:"),
                        (NSUInteger)~0UL,   /* NSEventMaskAny */
                        nil,               /* no wait */
-                       BG_MSG(id, objc_getClass("NSString"), "stringWithUTF8String:", "kCFRunLoopDefaultMode"),
+                       BG_MSG(id, objc_getClass("NSString"), "stringWithUTF8String:", "NSDefaultRunLoopMode"),
                        YES);
         if (!event) break;
 
@@ -628,8 +635,11 @@ void bg_swap_buffers(void) {
 }
 
 void bg_terminate(void) {
+    if (bg__window)     { BG_MSG(void, bg__window, "close"); bg__window = nil; }
     if (bg__colorspace) { CGColorSpaceRelease(bg__colorspace); bg__colorspace = NULL; }
     if (bg__pool)       { BG_MSG(void, bg__pool, "drain"); bg__pool = NULL; }
+    bg__view = nil;
+    bg__app  = nil;
     free(bg__pixels); bg__pixels = NULL;
 }
 
