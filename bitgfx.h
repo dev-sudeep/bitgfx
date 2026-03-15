@@ -403,6 +403,11 @@ int bg_is_key_down(int keycode) {
 
 /* =========================================================================
  * macOS IMPLEMENTATION  (ObjC runtime + CoreGraphics, pure C)
+ *
+ * bg_init() is called from main() which IS the OS main thread.
+ * All AppKit/NSWindow setup happens there. bg_poll_events() spins NSRunLoop
+ * for one iteration per frame -- the correct way to drive AppKit without
+ * blocking. No pthread needed.
  * ========================================================================= */
 #elif defined(__APPLE__)
 
@@ -411,92 +416,170 @@ int bg_is_key_down(int keycode) {
 #include <objc/message.h>
 #include <CoreGraphics/CoreGraphics.h>
 
-/* Suppress variadic cast warnings on Apple clang */
-typedef id   (*id_msgSend)(id, SEL, ...);
-typedef void (*void_msgSend)(id, SEL, ...);
-typedef BOOL (*bool_msgSend)(id, SEL, ...);
-typedef id   (*id_msgSend_rect)(id, SEL, CGRect, ...);
+#ifndef BOOL
+#  define BOOL signed char
+#endif
+#ifndef YES
+#  define YES ((BOOL)1)
+#endif
+#ifndef NO
+#  define NO  ((BOOL)0)
+#endif
+#ifndef NSInteger
+   typedef long          NSInteger;
+   typedef unsigned long NSUInteger;
+#endif
 
-#define BG_MSG(ret, obj, sel_str, ...) \
-    ((ret(*)(id,SEL,...))objc_msgSend)((id)(obj), sel_getUid(sel_str), ##__VA_ARGS__)
+#define BG_MSG_VOID(o,s)        ((void(*)(id,SEL))objc_msgSend)((id)(o),(s))
+#define BG_MSG_ID(o,s)          ((id(*)(id,SEL))objc_msgSend)((id)(o),(s))
+#define BG_MSG_VOID_ID(o,s,a)   ((void(*)(id,SEL,id))objc_msgSend)((id)(o),(s),(id)(a))
+#define BG_MSG_VOID_BOOL(o,s,a) ((void(*)(id,SEL,BOOL))objc_msgSend)((id)(o),(s),(BOOL)(a))
+#define BG_MSG_VOID_INT(o,s,a)  ((void(*)(id,SEL,NSInteger))objc_msgSend)((id)(o),(s),(NSInteger)(a))
+#define BG_MSG_BOOL(o,s)        ((BOOL(*)(id,SEL))objc_msgSend)((id)(o),(s))
+#define BG_MSG_INT(o,s)         ((NSInteger(*)(id,SEL))objc_msgSend)((id)(o),(s))
+#define BG_MSG_UINT(o,s)        ((NSUInteger(*)(id,SEL))objc_msgSend)((id)(o),(s))
+#define BG_MSG_ID_STR(o,s,c)    ((id(*)(id,SEL,const char*))objc_msgSend)((id)(o),(s),(c))
+#define BG_MSG_CSTR(o,s)        ((const char*(*)(id,SEL))objc_msgSend)((id)(o),(s))
+#define BG_MSG_CGCTX(o,s)       ((CGContextRef(*)(id,SEL))objc_msgSend)((id)(o),(s))
 
-#define BG_MSG_SUPER(ret, obj, cls_str, sel_str, ...) \
-    ((ret(*)(id,SEL,...))objc_msgSendSuper)(\
-        &(struct objc_super){(id)(obj), (Class)objc_getClass(cls_str)}, \
-        sel_getUid(sel_str), ##__VA_ARGS__)
-
-static id bg__app       = nil;
-static id bg__window    = nil;
-static id bg__view      = nil;
-static id bg__pool      = nil;
+static id              bg__app    = nil;
+static id              bg__window = nil;
+static id              bg__view   = nil;
+static id              bg__pool   = nil;
 static CGColorSpaceRef bg__colorspace = NULL;
 
-/* ---- Custom NSView subclass for drawing ---- */
-static Class bg__ViewClass = NULL;
+static SEL bg__sel_alloc, bg__sel_init, bg__sel_drain;
+static SEL bg__sel_sharedApp, bg__sel_setActPolicy, bg__sel_finishLaunching;
+static SEL bg__sel_initContentRect, bg__sel_setTitle, bg__sel_initFrame;
+static SEL bg__sel_setContentView, bg__sel_makeKey, bg__sel_activate;
+static SEL bg__sel_setDelegate, bg__sel_setMouseMoved;
+static SEL bg__sel_nextEvent, bg__sel_sendEvent, bg__sel_updateWindows;
+static SEL bg__sel_type, bg__sel_locationInWindow;
+static SEL bg__sel_modFlags, bg__sel_keyCode, bg__sel_chars, bg__sel_charsIgn;
+static SEL bg__sel_utf8, bg__sel_isVisible, bg__sel_close;
+static SEL bg__sel_setNeedsDisplay, bg__sel_display;
+static SEL bg__sel_currentCtx, bg__sel_cgCtx;
+static SEL bg__sel_distantPast, bg__sel_stringUTF8, bg__sel_runMode;
 
-static void bg__view_drawRect(id self, SEL _cmd, CGRect rect) {
+static Class bg__cls_NSApp, bg__cls_NSWindow, bg__cls_NSString;
+static Class bg__cls_NSDate, bg__cls_NSGfxCtx, bg__cls_NSPool;
+static Class bg__cls_NSRunLoop, bg__cls_NSObject;
+static Class bg__cls_BITGFXView = NULL;
+
+static void bg__cache(void) {
+    bg__sel_alloc          = sel_registerName("alloc");
+    bg__sel_init           = sel_registerName("init");
+    bg__sel_drain          = sel_registerName("drain");
+    bg__sel_sharedApp      = sel_registerName("sharedApplication");
+    bg__sel_setActPolicy   = sel_registerName("setActivationPolicy:");
+    bg__sel_finishLaunching= sel_registerName("finishLaunching");
+    bg__sel_initContentRect= sel_registerName("initWithContentRect:styleMask:backing:defer:");
+    bg__sel_setTitle       = sel_registerName("setTitle:");
+    bg__sel_initFrame      = sel_registerName("initWithFrame:");
+    bg__sel_setContentView = sel_registerName("setContentView:");
+    bg__sel_makeKey        = sel_registerName("makeKeyAndOrderFront:");
+    bg__sel_activate       = sel_registerName("activateIgnoringOtherApps:");
+    bg__sel_setDelegate    = sel_registerName("setDelegate:");
+    bg__sel_setMouseMoved  = sel_registerName("setAcceptsMouseMovedEvents:");
+    bg__sel_nextEvent      = sel_registerName("nextEventMatchingMask:untilDate:inMode:dequeue:");
+    bg__sel_sendEvent      = sel_registerName("sendEvent:");
+    bg__sel_updateWindows  = sel_registerName("updateWindows");
+    bg__sel_type           = sel_registerName("type");
+    bg__sel_locationInWindow = sel_registerName("locationInWindow");
+    bg__sel_modFlags       = sel_registerName("modifierFlags");
+    bg__sel_keyCode        = sel_registerName("keyCode");
+    bg__sel_chars          = sel_registerName("characters");
+    bg__sel_charsIgn       = sel_registerName("charactersIgnoringModifiers");
+    bg__sel_utf8           = sel_registerName("UTF8String");
+    bg__sel_isVisible      = sel_registerName("isVisible");
+    bg__sel_close          = sel_registerName("close");
+    bg__sel_setNeedsDisplay= sel_registerName("setNeedsDisplay:");
+    bg__sel_display        = sel_registerName("display");
+    bg__sel_currentCtx     = sel_registerName("currentContext");
+    bg__sel_cgCtx          = sel_registerName("CGContext");
+    bg__sel_distantPast    = sel_registerName("distantPast");
+    bg__sel_stringUTF8     = sel_registerName("stringWithUTF8String:");
+    bg__sel_runMode        = sel_registerName("runMode:beforeDate:");
+
+    bg__cls_NSApp    = objc_getClass("NSApplication");
+    bg__cls_NSWindow = objc_getClass("NSWindow");
+    bg__cls_NSString = objc_getClass("NSString");
+    bg__cls_NSDate   = objc_getClass("NSDate");
+    bg__cls_NSGfxCtx = objc_getClass("NSGraphicsContext");
+    bg__cls_NSPool   = objc_getClass("NSAutoreleasePool");
+    bg__cls_NSRunLoop= objc_getClass("NSRunLoop");
+    bg__cls_NSObject = objc_getClass("NSObject");
+}
+
+static void bg__drawRect(id self, SEL _cmd, CGRect rect) {
     (void)self; (void)_cmd; (void)rect;
-    id bg__gc = BG_MSG(id, objc_getClass("NSGraphicsContext"), "currentContext");
-    if (!bg__gc) return;
-    CGContextRef ctx = BG_MSG(CGContextRef, bg__gc, "CGContext");
+    id gc = BG_MSG_ID((id)bg__cls_NSGfxCtx, bg__sel_currentCtx);
+    if (!gc) return;
+    CGContextRef ctx = BG_MSG_CGCTX(gc, bg__sel_cgCtx);
     if (!ctx) return;
 
-    CGDataProviderRef provider = CGDataProviderCreateWithData(
-        NULL, bg__pixels,
-        (size_t)(bg__width * bg__height * 4), NULL);
-    if (!provider) return;
-
+    size_t row_bytes = (size_t)bg__width * 4;
+    CGDataProviderRef prov = CGDataProviderCreateWithData(
+        NULL, bg__pixels, row_bytes * (size_t)bg__height, NULL);
+    if (!prov) return;
     CGImageRef img = CGImageCreate(
-        (size_t)bg__width, (size_t)bg__height,
-        8, 32, (size_t)(bg__width * 4),
+        (size_t)bg__width, (size_t)bg__height, 8, 32, row_bytes,
         bg__colorspace,
         kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little,
-        provider, NULL, false, kCGRenderingIntentDefault);
-
-    CGDataProviderRelease(provider);
+        prov, NULL, false, kCGRenderingIntentDefault);
+    CGDataProviderRelease(prov);
     if (!img) return;
-
-    /* CoreGraphics origin is bottom-left; flip vertically so the buffer
-       (which is top-left origin) renders the right way up.              */
-    CGContextSaveGState(ctx);
-    CGContextTranslateCTM(ctx, 0, (CGFloat)bg__height);
-    CGContextScaleCTM(ctx, 1.0, -1.0);
-    CGRect bounds = CGRectMake(0, 0, (CGFloat)bg__width, (CGFloat)bg__height);
-    CGContextDrawImage(ctx, bounds, img);
-    CGContextRestoreGState(ctx);
+    /* CGContextDrawImage maps the image's row 0 to the bottom-left of the
+       dest rect (CG lower-left origin). Our buffer has row 0 at the top.
+       Drawing into a rect with origin.y = height and height = -height makes
+       CG map row 0 of the image to the top of the view instead. We do NOT
+       touch the CTM — AppKit may have already applied transforms and adding
+       another flip would double-invert the image. */
+    CGContextDrawImage(ctx,
+        CGRectMake(0, (CGFloat)bg__height,
+                   (CGFloat)bg__width, -(CGFloat)bg__height),
+        img);
     CGImageRelease(img);
 }
 
-static void bg__register_view_class(void) {
-    /* Guard: if bg_init is called again after bg_terminate, the class already
-       exists in the ObjC runtime — allocating it again returns NULL and
-       crashes on the subsequent class_addMethod call. */
-    bg__ViewClass = (Class)objc_getClass("BITGFXView");
-    if (bg__ViewClass) return; /* already registered */
-    bg__ViewClass = objc_allocateClassPair(
-        (Class)objc_getClass("NSView"), "BITGFXView", 0);
-
-    Method m = class_getInstanceMethod((Class)objc_getClass("NSView"),
-                                        sel_getUid("drawRect:"));
-    class_addMethod(bg__ViewClass, sel_getUid("drawRect:"),
-                    (IMP)bg__view_drawRect,
-                    method_getTypeEncoding(m));
-    objc_registerClassPair(bg__ViewClass);
+static void bg__register_view(void) {
+    if (objc_getClass("BITGFXView")) { bg__cls_BITGFXView = (Class)objc_getClass("BITGFXView"); return; }
+    bg__cls_BITGFXView = objc_allocateClassPair((Class)objc_getClass("NSView"), "BITGFXView", 0);
+    Method m = class_getInstanceMethod((Class)objc_getClass("NSView"), sel_registerName("drawRect:"));
+    class_addMethod(bg__cls_BITGFXView, sel_registerName("drawRect:"), (IMP)bg__drawRect, method_getTypeEncoding(m));
+    objc_registerClassPair(bg__cls_BITGFXView);
 }
 
-/* Track mouse position via event monitoring */
-static void bg__update_mouse_from_event(id event) {
-    /* locationInWindow returns NSPoint */
-    CGPoint loc;
-    /* objc_msgSend_stret is needed for structs on some archs,
-       but NSPoint is returned in registers on arm64/x86_64 */
-    typedef CGPoint (*NSPointFn)(id, SEL);
-    loc = ((NSPointFn)objc_msgSend)(event, sel_getUid("locationInWindow"));
-    /* Flip Y (AppKit origin is bottom-left) */
-    bg__mouse_x = (int)loc.x;
-    bg__mouse_y = bg__height - 1 - (int)loc.y;
-    bg__mouse_x = bg__clamp(bg__mouse_x, 0, bg__width  - 1);
-    bg__mouse_y = bg__clamp(bg__mouse_y, 0, bg__height - 1);
+static void bg__winWillClose(id self, SEL _cmd, id n) {
+    (void)self; (void)_cmd; (void)n;
+    bg__should_close = 1;
+}
+
+static NSUInteger bg__appShouldTerminate(id self, SEL _cmd, id sender) {
+    (void)self; (void)_cmd; (void)sender;
+    bg__should_close = 1;
+    return 0;
+}
+
+static void bg__register_delegates(void) {
+    if (!objc_getClass("BITGFXWinDelegate")) {
+        Class wc = objc_allocateClassPair(bg__cls_NSObject, "BITGFXWinDelegate", 0);
+        class_addMethod(wc, sel_registerName("windowWillClose:"), (IMP)bg__winWillClose, "v@:@");
+        objc_registerClassPair(wc);
+    }
+    if (!objc_getClass("BITGFXAppDelegate")) {
+        Class ac = objc_allocateClassPair(bg__cls_NSObject, "BITGFXAppDelegate", 0);
+        class_addMethod(ac, sel_registerName("applicationShouldTerminate:"),
+                        (IMP)bg__appShouldTerminate, "L@:@");
+        objc_registerClassPair(ac);
+    }
+}
+
+static void bg__mouse_from_event(id ev) {
+    typedef CGPoint (*PointFn)(id, SEL);
+    CGPoint p = ((PointFn)objc_msgSend)(ev, bg__sel_locationInWindow);
+    bg__mouse_x = bg__clamp((int)p.x,                  0, bg__width  - 1);
+    bg__mouse_y = bg__clamp(bg__height - 1 - (int)p.y, 0, bg__height - 1);
 }
 
 int bg_init(int width, int height, const char *title) {
@@ -506,167 +589,133 @@ int bg_init(int width, int height, const char *title) {
     if (!bg__pixels) return 0;
 
     bg__colorspace = CGColorSpaceCreateDeviceRGB();
+    bg__cache();
 
-    /* AutoreleasePool — split alloc and init to avoid nesting across
-       two BG_MSG calls, which risks a double-free if alloc autorelease-registers itself */
-    bg__pool = BG_MSG(id, objc_getClass("NSAutoreleasePool"), "alloc");
-    bg__pool = BG_MSG(id, bg__pool, "init");
+    bg__pool = BG_MSG_ID((id)bg__cls_NSPool, bg__sel_alloc);
+    bg__pool = BG_MSG_ID(bg__pool, bg__sel_init);
 
-    /* NSApplication */
-    bg__app = BG_MSG(id, objc_getClass("NSApplication"), "sharedApplication");
-    BG_MSG(void, bg__app, "setActivationPolicy:", (NSInteger)0); /* NSApplicationActivationPolicyRegular */
-    BG_MSG(void, bg__app, "finishLaunching");
+    bg__app = BG_MSG_ID((id)bg__cls_NSApp, bg__sel_sharedApp);
+    BG_MSG_VOID_INT(bg__app, bg__sel_setActPolicy, (NSInteger)0);
 
-    /* Register our view class */
-    bg__register_view_class();
+    bg__register_view();
+    bg__register_delegates();
 
-    /* NSWindow */
-    /* Window style mask — numeric values match NSWindowStyleMask constants:
-       NSTitledWindowMask=1, NSClosableWindowMask=2,
-       NSMiniaturizableWindowMask=4, NSResizableWindowMask=8 */
-    NSUInteger style = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3);
-    CGRect frame = CGRectMake(100, 100, width, height);
+    id appDel = BG_MSG_ID(BG_MSG_ID((id)objc_getClass("BITGFXAppDelegate"), bg__sel_alloc), bg__sel_init);
+    BG_MSG_VOID_ID(bg__app, bg__sel_setDelegate, appDel);
 
-    id win = BG_MSG(id, objc_getClass("NSWindow"), "alloc");
+    BG_MSG_VOID(bg__app, bg__sel_finishLaunching);
+
+    NSUInteger style = (1<<0)|(1<<1)|(1<<2)|(1<<3);
+    CGRect frame = CGRectMake(200, 200, (CGFloat)width, (CGFloat)height);
+    id win = BG_MSG_ID((id)bg__cls_NSWindow, bg__sel_alloc);
     win = ((id(*)(id,SEL,CGRect,NSUInteger,NSUInteger,BOOL))objc_msgSend)(
-              win, sel_getUid("initWithContentRect:styleMask:backing:defer:"),
-              frame, style, (NSUInteger)2, NO);
+              win, bg__sel_initContentRect, frame, style, (NSUInteger)2, (BOOL)0);
     bg__window = win;
 
-    /* Set title */
-    id nsTitle = BG_MSG(id, objc_getClass("NSString"),
-                         "stringWithUTF8String:", title);
-    BG_MSG(void, bg__window, "setTitle:", nsTitle);
+    id nsTitle = BG_MSG_ID_STR((id)bg__cls_NSString, bg__sel_stringUTF8, title);
+    BG_MSG_VOID_ID(bg__window, bg__sel_setTitle, nsTitle);
 
-    /* Create view — frame is in superview coords, so origin must be (0,0) */
-    CGRect content_rect = CGRectMake(0, 0, (CGFloat)width, (CGFloat)height);
-    id view = BG_MSG(id, (id)bg__ViewClass, "alloc");
-    view = ((id(*)(id,SEL,CGRect))objc_msgSend)(
-               view, sel_getUid("initWithFrame:"), content_rect);
+    CGRect cr = CGRectMake(0, 0, (CGFloat)width, (CGFloat)height);
+    id view = BG_MSG_ID((id)bg__cls_BITGFXView, bg__sel_alloc);
+    view = ((id(*)(id,SEL,CGRect))objc_msgSend)(view, bg__sel_initFrame, cr);
     bg__view = view;
 
-    BG_MSG(void, bg__window, "setContentView:", bg__view);
-    BG_MSG(void, bg__window, "makeKeyAndOrderFront:", nil);
-    BG_MSG(void, bg__app, "activateIgnoringOtherApps:", YES);
+    BG_MSG_VOID_ID(bg__window, bg__sel_setContentView, bg__view);
+
+    id winDel = BG_MSG_ID(BG_MSG_ID((id)objc_getClass("BITGFXWinDelegate"), bg__sel_alloc), bg__sel_init);
+    BG_MSG_VOID_ID(bg__window, bg__sel_setDelegate, winDel);
+    BG_MSG_VOID_BOOL(bg__window, bg__sel_setMouseMoved, (BOOL)1);
+    BG_MSG_VOID_ID(bg__window, bg__sel_makeKey, nil);
+    BG_MSG_VOID_BOOL(bg__app, bg__sel_activate, (BOOL)1);
 
     return 1;
 }
 
 void bg_poll_events(void) {
-    bg__mouse_click = 0; /* cleared at the start of every poll */
-    /* Drain & renew autorelease pool */
-    BG_MSG(void, bg__pool, "drain");
-    bg__pool = BG_MSG(id, objc_getClass("NSAutoreleasePool"), "alloc");
-    bg__pool = BG_MSG(id, bg__pool, "init");
+    bg__mouse_click = 0;
 
+    BG_MSG_VOID(bg__pool, bg__sel_drain);
+    bg__pool = BG_MSG_ID((id)bg__cls_NSPool, bg__sel_alloc);
+    bg__pool = BG_MSG_ID(bg__pool, bg__sel_init);
+
+    /* Spin NSRunLoop once so AppKit can process internal sources */
+    id rl   = BG_MSG_ID((id)bg__cls_NSRunLoop, sel_registerName("currentRunLoop"));
+    id mode = BG_MSG_ID_STR((id)bg__cls_NSString, bg__sel_stringUTF8, "NSDefaultRunLoopMode");
+    id past = BG_MSG_ID((id)bg__cls_NSDate, bg__sel_distantPast);
+    ((BOOL(*)(id,SEL,id,id))objc_msgSend)(rl, bg__sel_runMode, mode, past);
+
+    /* Drain all pending NSEvents */
     for (;;) {
-        id event = ((id(*)(id,SEL,NSUInteger,id,id,BOOL))objc_msgSend)(
-                       bg__app,
-                       sel_getUid("nextEventMatchingMask:untilDate:inMode:dequeue:"),
-                       (NSUInteger)~0UL,   /* NSEventMaskAny */
-                       nil,               /* no wait */
-                       BG_MSG(id, objc_getClass("NSString"), "stringWithUTF8String:", "NSDefaultRunLoopMode"),
-                       YES);
-        if (!event) break;
+        id ev = ((id(*)(id,SEL,NSUInteger,id,id,BOOL))objc_msgSend)(
+                    bg__app, bg__sel_nextEvent,
+                    (NSUInteger)~0UL, past, mode, (BOOL)1);
+        if (!ev) break;
 
-        NSInteger type = BG_MSG(NSInteger, event, "type");
-
+        NSInteger type = BG_MSG_INT(ev, bg__sel_type);
         switch (type) {
-            case  1: /* NSEventTypeLeftMouseDown  */
-                bg__mouse_buttons |= (1 << 0);
-                bg__mouse_click = 1;
-                bg__update_mouse_from_event(event);
-                break;
-            case  2: /* NSEventTypeLeftMouseUp    */
-                bg__mouse_buttons &= ~(1 << 0);
-                bg__update_mouse_from_event(event);
-                break;
-            case  3: /* NSEventTypeRightMouseDown */
-                bg__mouse_buttons |=  (1 << 1);
-                bg__update_mouse_from_event(event);
-                break;
-            case  4: /* NSEventTypeRightMouseUp   */
-                bg__mouse_buttons &= ~(1 << 1);
-                bg__update_mouse_from_event(event);
-                break;
-            case  5: /* NSEventTypeMouseMoved     */
-            case  6: /* NSEventTypeLeftMouseDragged */
-            case  7: /* NSEventTypeRightMouseDragged */
-                bg__update_mouse_from_event(event);
-                break;
-            case 12: { /* NSEventTypeKeyDown */
-                NSUInteger mods = BG_MSG(NSUInteger, event, "modifierFlags");
-                /* Cmd+W closes window */
-                if (mods & (1u << 20)) {
-                    id ci = BG_MSG(id, event, "charactersIgnoringModifiers");
-                    const char *cw = BG_MSG(const char*, ci, "UTF8String");
+            case 1: bg__mouse_buttons |= (1<<0); bg__mouse_click = 1; bg__mouse_from_event(ev); break;
+            case 2: bg__mouse_buttons &= ~(1<<0); bg__mouse_from_event(ev); break;
+            case 3: bg__mouse_buttons |= (1<<1); bg__mouse_from_event(ev); break;
+            case 4: bg__mouse_buttons &= ~(1<<1); bg__mouse_from_event(ev); break;
+            case 5: case 6: case 7: bg__mouse_from_event(ev); break;
+            case 10: { /* NSEventTypeKeyDown */
+                NSUInteger mods = BG_MSG_UINT(ev, bg__sel_modFlags);
+                if (mods & (1u<<20)) {
+                    id ci = BG_MSG_ID(ev, bg__sel_charsIgn);
+                    const char *cw = BG_MSG_CSTR(ci, bg__sel_utf8);
                     if (cw && cw[0] == 'w') { bg__should_close = 1; break; }
                 }
-                /* Skip Command/Control key combos (except Backspace/Delete) */
-                if (!(mods & ((1u<<20)|(1u<<18)))) { /* not Cmd, not Ctrl */
-                    /* keyCode: 51=Backspace, 36=Return, 76=KPEnter,
-                                 53=Escape, 48=Tab, 123=Left, 124=Right,
-                                 126=Up, 125=Down, 117=Delete,
-                                 115=Home, 119=End                       */
-                    NSUInteger kc = BG_MSG(NSUInteger, event, "keyCode");
+                if (!(mods & ((1u<<20)|(1u<<18)))) {
+                    NSUInteger kc = BG_MSG_UINT(ev, bg__sel_keyCode);
                     uint32_t k = BG_KEY_NONE;
                     switch (kc) {
                         case  51: k = BG_KEY_BACKSPACE; break;
-                        case  36:
-                        case  76: k = BG_KEY_ENTER;     break;
-                        case  53: k = BG_KEY_ESCAPE;    break;
-                        case  48: k = BG_KEY_TAB;       break;
-                        case 123: k = BG_KEY_LEFT;      break;
-                        case 124: k = BG_KEY_RIGHT;     break;
-                        case 126: k = BG_KEY_UP;        break;
-                        case 125: k = BG_KEY_DOWN;      break;
-                        case 117: k = BG_KEY_DELETE;    break;
-                        case 115: k = BG_KEY_HOME;      break;
-                        case 119: k = BG_KEY_END;       break;
+                        case  36: case 76: k = BG_KEY_ENTER; break;
+                        case  53: k = BG_KEY_ESCAPE;  break;
+                        case  48: k = BG_KEY_TAB;     break;
+                        case 123: k = BG_KEY_LEFT;    break;
+                        case 124: k = BG_KEY_RIGHT;   break;
+                        case 126: k = BG_KEY_UP;      break;
+                        case 125: k = BG_KEY_DOWN;    break;
+                        case 117: k = BG_KEY_DELETE;  break;
+                        case 115: k = BG_KEY_HOME;    break;
+                        case 119: k = BG_KEY_END;     break;
                         default: {
-                            id ch = BG_MSG(id, event, "characters");
-                            const char *cs = BG_MSG(const char*, ch, "UTF8String");
+                            id ch = BG_MSG_ID(ev, bg__sel_chars);
+                            const char *cs = BG_MSG_CSTR(ch, bg__sel_utf8);
                             if (cs && (unsigned char)cs[0] >= 32 && (unsigned char)cs[0] <= 126)
                                 k = (uint32_t)(unsigned char)cs[0];
-                            break;
                         }
                     }
-                    if (k != BG_KEY_NONE) bg__key_push(k);
+                    if (k) bg__key_push(k);
                 }
                 break;
             }
             default: break;
         }
-
-        /* Check if window was closed (before sendEvent so bg__window
-           is still valid — sendEvent may trigger windowWillClose etc.) */
-        if (!bg__should_close && bg__window &&
-            !BG_MSG(BOOL, bg__window, "isVisible"))
+        BG_MSG_VOID_ID(bg__app, bg__sel_sendEvent, ev);
+        if (!bg__should_close && bg__window && !BG_MSG_BOOL(bg__window, bg__sel_isVisible))
             bg__should_close = 1;
-
-        BG_MSG(void, bg__app, "sendEvent:", event);
     }
+    BG_MSG_VOID(bg__app, bg__sel_updateWindows);
 }
 
 void bg_swap_buffers(void) {
-    /* Mark our view as needing display */
-    BG_MSG(void, bg__view, "setNeedsDisplay:", YES);
-    BG_MSG(void, bg__view, "display");
+    BG_MSG_VOID_BOOL(bg__view, bg__sel_setNeedsDisplay, (BOOL)1);
+    BG_MSG_VOID(bg__view, bg__sel_display);
 }
 
 void bg_terminate(void) {
-    if (bg__window)     { BG_MSG(void, bg__window, "close"); bg__window = nil; }
+    if (bg__window) { BG_MSG_VOID(bg__window, bg__sel_close); bg__window = nil; }
     if (bg__colorspace) { CGColorSpaceRelease(bg__colorspace); bg__colorspace = NULL; }
-    if (bg__pool)       { BG_MSG(void, bg__pool, "drain"); bg__pool = NULL; }
-    bg__view = nil;
-    bg__app  = nil;
+    if (bg__pool) { BG_MSG_VOID(bg__pool, bg__sel_drain); bg__pool = nil; }
+    bg__view = nil; bg__app = nil;
     free(bg__pixels); bg__pixels = NULL;
 }
 
 int bg_is_key_down(int keycode) {
-    /* Basic: check NSEvent modifierFlags for modifier keys */
     (void)keycode;
-    return 0; /* Full keymap polling not available without Carbon on modern macOS */
+    return 0;
 }
 
 #else
