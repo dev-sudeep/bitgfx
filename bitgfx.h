@@ -245,7 +245,10 @@ static inline int bg__clamp(int v, int lo, int hi) {
 static inline void bg__put_pixel_raw(int x, int y, uint8_t r, uint8_t g, uint8_t b) {
     if (x < 0 || x >= bg__width || y < 0 || y >= bg__height) return;
 #if defined(__APPLE__)
-    /* CoreGraphics: ARGB big-endian => stored as 0xAARRGGBB in native uint32 */
+    /* CoreGraphics with kCGBitmapByteOrder32Little|kCGImageAlphaNoneSkipFirst:
+       bytes in memory are [B, G, R, X] — on a little-endian machine this is
+       stored as 0x00RRGGBB in a uint32_t with the alpha/skip byte in bits 24-31.
+       We write 0xFF in the high byte so CGImageCreate sees a valid pixel. */
     bg__pixels[y * bg__width + x] = (0xFFu << 24) | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
 #else
     /* X11 XPutImage with 32-bit depth: pixel = 0x00RRGGBB */
@@ -299,6 +302,11 @@ int bg_init(int width, int height, const char *title) {
 
     bg__gc = XCreateGC(bg__dpy, bg__win, 0, NULL);
 
+    /* XCreateImage: bitmap_pad=32, bytes_per_line=0 (auto-calculated).
+       Works on both 24-bit and 32-bit TrueColor visuals because X11 uses
+       32bpp storage for 24-bit depth internally.  If DefaultVisual is not
+       TrueColor (very rare on modern systems) XPutImage will produce wrong
+       colours but won't crash. */
     bg__ximg = XCreateImage(bg__dpy, vis, (unsigned)depth, ZPixmap, 0,
                              (char*)bg__pixels,
                              (unsigned)width, (unsigned)height, 32, 0);
@@ -402,7 +410,6 @@ int bg_is_key_down(int keycode) {
 #include <objc/runtime.h>
 #include <objc/message.h>
 #include <CoreGraphics/CoreGraphics.h>
-#include <dlfcn.h>
 
 /* Suppress variadic cast warnings on Apple clang */
 typedef id   (*id_msgSend)(id, SEL, ...);
@@ -428,7 +435,7 @@ static CGColorSpaceRef bg__colorspace = NULL;
 static Class bg__ViewClass = NULL;
 
 static void bg__view_drawRect(id self, SEL _cmd, CGRect rect) {
-    (void)_cmd; (void)rect;
+    (void)self; (void)_cmd; (void)rect;
     id bg__gc = BG_MSG(id, objc_getClass("NSGraphicsContext"), "currentContext");
     if (!bg__gc) return;
     CGContextRef ctx = BG_MSG(CGContextRef, bg__gc, "CGContext");
@@ -461,6 +468,11 @@ static void bg__view_drawRect(id self, SEL _cmd, CGRect rect) {
 }
 
 static void bg__register_view_class(void) {
+    /* Guard: if bg_init is called again after bg_terminate, the class already
+       exists in the ObjC runtime — allocating it again returns NULL and
+       crashes on the subsequent class_addMethod call. */
+    bg__ViewClass = (Class)objc_getClass("BITGFXView");
+    if (bg__ViewClass) return; /* already registered */
     bg__ViewClass = objc_allocateClassPair(
         (Class)objc_getClass("NSView"), "BITGFXView", 0);
 
@@ -495,8 +507,10 @@ int bg_init(int width, int height, const char *title) {
 
     bg__colorspace = CGColorSpaceCreateDeviceRGB();
 
-    /* AutoreleasePool */
-    bg__pool = BG_MSG(id, BG_MSG(id, objc_getClass("NSAutoreleasePool"), "alloc"), "init");
+    /* AutoreleasePool — split alloc and init to avoid nesting across
+       two BG_MSG calls, which risks a double-free if alloc autorelease-registers itself */
+    bg__pool = BG_MSG(id, objc_getClass("NSAutoreleasePool"), "alloc");
+    bg__pool = BG_MSG(id, bg__pool, "init");
 
     /* NSApplication */
     bg__app = BG_MSG(id, objc_getClass("NSApplication"), "sharedApplication");
@@ -507,7 +521,10 @@ int bg_init(int width, int height, const char *title) {
     bg__register_view_class();
 
     /* NSWindow */
-    NSUInteger style = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3); /* titled|closable|miniaturizable|resizable */
+    /* Window style mask — numeric values match NSWindowStyleMask constants:
+       NSTitledWindowMask=1, NSClosableWindowMask=2,
+       NSMiniaturizableWindowMask=4, NSResizableWindowMask=8 */
+    NSUInteger style = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3);
     CGRect frame = CGRectMake(100, 100, width, height);
 
     id win = BG_MSG(id, objc_getClass("NSWindow"), "alloc");
@@ -539,7 +556,8 @@ void bg_poll_events(void) {
     bg__mouse_click = 0; /* cleared at the start of every poll */
     /* Drain & renew autorelease pool */
     BG_MSG(void, bg__pool, "drain");
-    bg__pool = BG_MSG(id, BG_MSG(id, objc_getClass("NSAutoreleasePool"), "alloc"), "init");
+    bg__pool = BG_MSG(id, objc_getClass("NSAutoreleasePool"), "alloc");
+    bg__pool = BG_MSG(id, bg__pool, "init");
 
     for (;;) {
         id event = ((id(*)(id,SEL,NSUInteger,id,id,BOOL))objc_msgSend)(
@@ -620,8 +638,10 @@ void bg_poll_events(void) {
             default: break;
         }
 
-        /* Check if window was closed */
-        if (!BG_MSG(BOOL, bg__window, "isVisible"))
+        /* Check if window was closed (before sendEvent so bg__window
+           is still valid — sendEvent may trigger windowWillClose etc.) */
+        if (!bg__should_close && bg__window &&
+            !BG_MSG(BOOL, bg__window, "isVisible"))
             bg__should_close = 1;
 
         BG_MSG(void, bg__app, "sendEvent:", event);
@@ -665,6 +685,7 @@ void bg_get_mouse_pos(int *x, int *y) {
 }
 
 int bg_is_mouse_down(int button) {
+    if (button < 0 || button > 2) return 0;
     return (bg__mouse_buttons >> button) & 1;
 }
 
@@ -769,14 +790,14 @@ int bg_draw_textbox(int x, int y, int w, int h, BgTextbox *tb) {
 
 /* ---- bg_clear ---- */
 void bg_clear(uint8_t r, uint8_t g, uint8_t b) {
-    int n = bg__width * bg__height;
+    size_t n = (size_t)bg__width * (size_t)bg__height;
     uint32_t color;
 #if defined(__APPLE__)
     color = (0xFFu << 24) | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
 #else
     color = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
 #endif
-    for (int i = 0; i < n; i++) bg__pixels[i] = color;
+    for (size_t i = 0; i < n; i++) bg__pixels[i] = color;
 }
 
 /* ---- bg_set_pixel ---- */
@@ -877,4 +898,4 @@ int bg_draw_button(int x, int y, int w, int h, const char *label) {
 }
 
 #endif /* BITGFX_IMPLEMENTATION */
-#endif /* BITGFX_H */
+#endif /* BITGFX_H */ 
