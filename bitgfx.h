@@ -32,6 +32,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdbool.h>
 
 /* =========================================================================
  * PUBLIC API
@@ -407,7 +408,7 @@ struct Rect{
 
 typedef struct bgColor bgColor;
 typedef struct bgPos bgPos;
-typedef strict Rect Rect;
+typedef struct Rect Rect;
 
 int bg_should_close(void) { return bg__should_close; }
 
@@ -429,11 +430,11 @@ void bg_draw_line(bgPos p0, bgPos p1, bgColor c) {
     }
 }
 
-void bg_draw_rect(Rect r, bool outlined; bgColor c){
+void bg_draw_rect(Rect r, bool outlined, bgColor c){
 
-    if(outlined){
+    if(!outlined){
         for(int i = r.y0; i != r.y1;){
-            bg_draw_line((bgPos){r.x0, r.y0}, (bgPos){r.x1, r.y1}, c);
+            bg_draw_line((bgPos){r.x0, i}, (bgPos){r.x1, i}, c);
             if(r.y0 < r.y1) i++;
             if(r.y0 > r.y1) i--;
         }
